@@ -10,6 +10,7 @@
             "includePath": [
                 "c:/Users/giova/OneDrive/Documentos/PlatformIO/Projects/230614-143810-nodemcuv2/include",
                 "c:/Users/giova/OneDrive/Documentos/PlatformIO/Projects/230614-143810-nodemcuv2/src",
+                "c:/Users/giova/OneDrive/Documentos/PlatformIO/Projects/230614-143810-nodemcuv2/lib/NTPClient",
                 "c:/Users/giova/OneDrive/Documentos/PlatformIO/Projects/230614-143810-nodemcuv2/lib/MFRC522/src",
                 "C:/Users/giova/.platformio/packages/framework-arduinoespressif8266/libraries/LittleFS/src",
                 "c:/Users/giova/OneDrive/Documentos/PlatformIO/Projects/230614-143810-nodemcuv2/lib/ESPAsyncWebSrv/src",
@@ -66,6 +67,7 @@
                 "path": [
                     "c:/Users/giova/OneDrive/Documentos/PlatformIO/Projects/230614-143810-nodemcuv2/include",
                     "c:/Users/giova/OneDrive/Documentos/PlatformIO/Projects/230614-143810-nodemcuv2/src",
+                    "c:/Users/giova/OneDrive/Documentos/PlatformIO/Projects/230614-143810-nodemcuv2/lib/NTPClient",
                     "c:/Users/giova/OneDrive/Documentos/PlatformIO/Projects/230614-143810-nodemcuv2/lib/MFRC522/src",
                     "C:/Users/giova/.platformio/packages/framework-arduinoespressif8266/libraries/LittleFS/src",
                     "c:/Users/giova/OneDrive/Documentos/PlatformIO/Projects/230614-143810-nodemcuv2/lib/ESPAsyncWebSrv/src",

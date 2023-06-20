@@ -1,6 +1,9 @@
 #include <string.h>
 #include <LittleFS.h>
 
+#include <NTPClient.h>
+#include <WiFiUdp.h>
+
 #include <ESP8266WiFi.h>
 
 #include <ESPAsyncWebSrv.h>
@@ -13,8 +16,12 @@
 #include <Adafruit_ST7735.h> // Hardware-specific library for ST7735
 
 #define MASTERCARD "0935D9AC"
+#define RESETCARD "6375457A"
 
 AsyncWebServer server(80);
+
+WiFiUDP ntpUDP;
+NTPClient timeClient(ntpUDP);
 
 // Configuracao do RFID
 constexpr uint8_t RFID_RST_PIN = D3;
@@ -52,11 +59,12 @@ bool willRestart = 0;
 // RFID callback
 void (*rfidReadCallback)(String) = NULL;
 struct RFIDCallbackContext {
-  AsyncWebServerRequest *request;
   unsigned long ms;
   String rfid;
   String name;
   String role;
+  String session;
+  String req_login;
   short accesslvl;
 } rfidReadContext;
 
@@ -81,8 +89,10 @@ void setup() {
   printSubHeader();
   printMessageDefault();
 
+  clearRfidReadCallback();
+
   server.on("/dooraccess", HTTP_GET, [](AsyncWebServerRequest *request) {
-    Serial.println("ENDPOINT 1");
+    Serial.println("ENDPOINT - NETWORK DISCOVERY");
     request->send(200, "text/plain", "NodeMCU Door Access API");
   });
 
@@ -91,7 +101,7 @@ void setup() {
     WiFi.softAP(configWiFiName2, configWiFiPassword2);
 
     server.on("/ssid", HTTP_GET, [](AsyncWebServerRequest *request) {
-      Serial.println("ENDPOINT 2");
+      Serial.println("ENDPOINT - WIFI SETUP");
       AsyncWebParameter* ssid;
       AsyncWebParameter* pass;
 
@@ -104,16 +114,16 @@ void setup() {
       }
 
       if (ssid && pass) {
-        Serial.println("ENDPOINT 2A");
+        Serial.println("VALID WIFI SETUP");
         saveConfig("wifi_reset", "2");
         saveConfig("wifi_nome", ssid->value());
         saveConfig("wifi_senha", pass->value());
-        request->send(200);
+        request->send(204);
 
         Serial.println("Salvo com sucesso");
-        ESP.restart();
+        clearMessageInFiveSeconds(true);
       } else {
-        Serial.println("ENDPOINT 2B");
+        Serial.println("INVALID WIFI SETUP");
         request->send(400);
       }
     });
@@ -130,83 +140,178 @@ void setup() {
       Serial.println(WiFi.localIP());
       if (configReset == 2) {
         saveConfig("wifi_reset", "0");
+        configReset = 0;
       }
     } else {
       saveConfig("wifi_reset", "1");
       ESP.restart();
+      return;
     }
 
-    server.on("/logs", HTTP_GET, [](AsyncWebServerRequest *request) {
-      Serial.println("ENDPOINT 3");
-      request->send(LittleFS, "log.csv");
-    });
+    timeClient.begin();
+    timeClient.setTimeOffset(-3);
 
     server.on("/login", HTTP_GET, [](AsyncWebServerRequest *request) {
-      Serial.println("ENDPOINT 4");
-      clearRfidReadCallback(true);
+      Serial.println("ENDPOINT - LOGIN");
+      if (checkRfidReadCallback()) {
+        request->send(409);
+        return;
+      }
 
-      rfidReadContext.request = request;
       rfidReadContext.ms = millis();
       rfidReadCallback = doLogin;
+      request->send(204);
+    });
+
+    server.on("/login_rfid", HTTP_GET, [](AsyncWebServerRequest *request) {
+      Serial.println("ENDPOINT - LOGIN RFID");
+      
+      if (!rfidReadContext.ms) {
+        request->send(400);
+      } else if (rfidReadContext.rfid.equals("")) {
+        request->send(204);
+      } else {
+        String line = "";
+        line.concat(rfidReadContext.rfid);
+        line.concat(",");
+        line.concat(char(rfidReadContext.accesslvl + '0'));
+        line.concat(",");
+        line.concat(rfidReadContext.name);
+        line.concat(",");
+        line.concat(rfidReadContext.role);
+        line.concat(",");
+        line.concat(rfidReadContext.session);
+
+        Serial.println("LOGIN - USER TO CSV");
+
+        request->send(200, "text/csv", line);
+        clearRfidReadCallback();
+      }
+    });
+
+    server.on("/logs", HTTP_GET, [](AsyncWebServerRequest *request) {
+      Serial.println("ENDPOINT - LOGS");
+      if (!authenticateUser(request)) {
+        request->send(403);
+        return;
+      }
+
+      request->send(LittleFS, "log.csv", "text/csv");
     });
 
     server.on("/users", HTTP_GET, [](AsyncWebServerRequest *request) {
-      Serial.println("ENDPOINT 5");
-      request->send(LittleFS, "lista.csv");
+      Serial.println("ENDPOINT - USERS");
+      if (!authenticateUser(request)) {
+        request->send(403);
+        return;
+      }
+
+      request->send(LittleFS, "lista.csv", "text/csv");
     });
 
-    server.on("/users", HTTP_POST, [](AsyncWebServerRequest *request) {
-      Serial.println("ENDPOINT 6");
-      AsyncWebParameter* rfid;
-      AsyncWebParameter* name;
-      AsyncWebParameter* role;
+    server.on("/user_regedit", HTTP_GET, [](AsyncWebServerRequest *request) {
+      Serial.println("ENDPOINT - USER REGISTER/EDIT");
+      if (!authenticateUser(request)) {
+        request->send(403);
+        return;
+      }
+
+      String rfid = "";
+      String name = "";
+      String role = "";
       short accesslvl = 1;
       bool create = false;
 
-      if (request->hasParam("rfid", true)) {
-        rfid = request->getParam("rfid", true);
+      if (request->hasParam("rfid")) {
+        AsyncWebParameter* param = request->getParam("rfid");
+        rfid = param->value();
       } else {
         create = true;
       }
       
-      if (request->hasParam("name", true)) {
-        name = request->getParam("name", true);
+      if (request->hasParam("name")) {
+        AsyncWebParameter* param = request->getParam("name");
+        name = param->value();
       }
 
-      if (request->hasParam("role", true)) {
-        role = request->getParam("role", true);
+      if (request->hasParam("role")) {
+        AsyncWebParameter* param = request->getParam("role");
+        role = param->value();
       }
 
-      if (request->hasParam("mod", true)) {
-        accesslvl = 2;
+      if (request->hasParam("mod")) {
+        AsyncWebParameter* param = request->getParam("mod");
+        String value = param->value();
+        if (value.equals("1")) {
+          accesslvl = 2;
+        }
       }
 
-      if (request->hasParam("admin", true)) {
-        accesslvl = 3;
-      }
-
-      if (!name || !role) {
+      if (name.equals("") || role.equals("")) {
         request->send(400);
         return;
       }
       
       if (create) {
-        clearRfidReadCallback(true);
+        clearRfidReadCallback();
 
-        rfidReadContext.request = request;
-        rfidReadContext.name = name->value();
-        rfidReadContext.role = role->value();
+        rfidReadContext.name = name;
+        rfidReadContext.role = role;
         rfidReadContext.accesslvl = accesslvl;
         rfidReadContext.ms = millis();
+        rfidReadContext.req_login = getLoginUser(request);
         rfidReadCallback = createRfidUser;
+        request->send(204);
       } else {
-        saveUser(rfid->value(), name->value(), role->value(), accesslvl);
-        request->send(200);
+        String adm = getLoginUser(request);
+
+        String session = "";
+        String dummy = "";
+        uint8_t oldaccesslvl = getUser(rfid, &dummy, &dummy, &session);
+        if (oldaccesslvl == 3) {
+          request->send(501);
+          return;
+        }
+        
+        saveLog(rfid, accesslvl + 10, adm);
+        saveUser(rfid, name, role, session, accesslvl);
+        request->send(204);
       }
     });
 
-    server.on("/users", HTTP_DELETE, [](AsyncWebServerRequest *request) {
-      Serial.println("ENDPOINT 7");
+    server.on("/user_regedit_rfid", HTTP_GET, [](AsyncWebServerRequest *request) {
+      Serial.println("ENDPOINT - USER REGISTER/EDIT RFID");
+      
+      if (!rfidReadContext.ms) {
+        request->send(400);
+      } else if (rfidReadContext.rfid.equals("")) {
+        request->send(204);
+      } else {
+        String line = "";
+        line.concat(rfidReadContext.rfid);
+        line.concat(",");
+        line.concat(char(rfidReadContext.accesslvl + '0'));
+        line.concat(",");
+        line.concat(rfidReadContext.name);
+        line.concat(",");
+        line.concat(rfidReadContext.role);
+        line.concat(",");
+        line.concat(rfidReadContext.session);
+
+        Serial.println("REGISTER - USER TO CSV");
+
+        request->send(200, "text/csv", line);
+        clearRfidReadCallback();
+      }
+    });
+
+    server.on("/user_del", HTTP_GET, [](AsyncWebServerRequest *request) {
+      Serial.println("ENDPOINT - USER DELL");
+      if (!authenticateUser(request)) {
+        request->send(403);
+        return;
+      }
+
       AsyncWebParameter* rfid;
 
       if (request->hasParam("rfid")) {
@@ -214,8 +319,23 @@ void setup() {
       }
 
       if (rfid) {
-        saveUser(rfid->value(), 0);
-        request->send(200);
+        String value = rfid->value();
+        String adm = getLoginUser(request);
+        saveLog(value, 10, adm);
+        
+        String name = "";
+        String role = "";
+        String session = "";
+
+        uint8_t accesslvl = getUser(value, &name, &role, &session);
+        if (accesslvl == 3) {
+          request->send(501);
+          return;
+        }
+
+        saveUser(value, name, role, session, 0);
+
+        request->send(204);
       } else {
         request->send(400);
       }
@@ -225,29 +345,124 @@ void setup() {
   server.begin();
 }
 
-void clearRfidReadCallback(bool cancel) {
-  if (cancel && rfidReadContext.request) {
-    rfidReadContext.request->send(409);
+String getLoginUser(AsyncWebServerRequest *request) {
+  Serial.println("GET LOGIN USER");
+
+  if (!request->hasHeader("X-RFID")) {
+    Serial.println("NO X-RFID HEADER");
+    return "";
   }
 
-  rfidReadContext.request = NULL;
-  rfidReadContext.name = NULL;
-  rfidReadContext.role = NULL;
+  AsyncWebHeader *header = request->getHeader("X-RFID");
+  String rfid = header->value();
+  Serial.println(rfid);
+  return rfid;
+}
+
+bool authenticateUser(AsyncWebServerRequest *request) {
+  Serial.println("AUTHENTICATE");
+
+  if (!request->hasHeader("X-RFID")) {
+    Serial.println("NO X-RFID HEADER");
+    return false;
+  }
+
+  AsyncWebHeader *header = request->getHeader("X-RFID");
+  String rfid = header->value();
+  String session = "";
+  String dummy = "";
+
+  uint8_t accesslvl = getUser(rfid, &dummy, &dummy, &session);
+  if (accesslvl <= 1) {
+    Serial.println("LOW ACCESS LEVEL");
+    return false;
+  }
+
+  unsigned long session_ms = atol(session.c_str());
+  unsigned long expires = timeClient.getEpochTime() + 604800;
+
+  if (session_ms == 0) {
+    Serial.println("NO SESSION FOUND");
+    return false;
+  }
+
+  if (session_ms > expires) {
+    Serial.println("SESSION EXPIRED");
+    return false;
+  }
+
+  return request->authenticate(rfid.c_str(), session.c_str());
+}
+
+bool checkRfidReadCallback() {
+  if (rfidReadContext.ms) {
+    return true;
+  } else {
+    clearRfidReadCallback();
+    return false;
+  }
+}
+
+void clearRfidReadCallback() {
+  rfidReadContext.rfid = "";
+  rfidReadContext.name = "";
+  rfidReadContext.role = "";
+  rfidReadContext.session = "";
+  rfidReadContext.req_login = "";
   rfidReadContext.accesslvl = 0;
+  rfidReadContext.ms = 0;
+  rfidReadCallback = NULL;
+}
+
+void clearRfidReadCallbackPartial() {
   rfidReadCallback = NULL;
 }
 
 void createRfidUser(String rfid) {
-  saveUser(rfid, rfidReadContext.name, rfidReadContext.role, rfidReadContext.accesslvl);
-  rfidReadContext.request->send(200);
+  rfidReadContext.rfid = rfid;
+
+  saveUser(rfid, rfidReadContext.name, rfidReadContext.role, "0", rfidReadContext.accesslvl);
+
+  if (rfidReadContext.accesslvl == 3) {
+    saveLog(rfid, 13, rfid);
+
+    clearMessage();
+    displayPrint("Cartao admin registrado.", ST77XX_CYAN);
+    clearMessageInFiveSeconds(false);
+  } else {
+    saveLog(rfid, rfidReadContext.accesslvl + 10, rfidReadContext.req_login);
+
+    clearMessage();
+    displayPrint("Cartao registrado.", ST77XX_CYAN);
+    clearMessageInFiveSeconds(false);
+  }
 }
 
 void doLogin(String rfid) {
-  uint32_t session = ESP.random();
-  char sess[20];
-  sprintf(sess, "%x", session);
+  Serial.println("LOGIN - CALLBACK FUNCTION");
 
-  rfidReadContext.request->send(200, "text/plain", sess);
+  String dummy = "";
+  rfidReadContext.accesslvl = getUser(rfid, &rfidReadContext.name, &rfidReadContext.role, &dummy);
+  rfidReadContext.rfid.concat(rfid);
+
+  if (rfidReadContext.accesslvl <= 1) {
+    Serial.println("LOGIN - NOT A MODERATOR");
+    clearRfidReadCallback();
+    return;
+  }
+
+  unsigned long session = timeClient.getEpochTime();
+  char sess[50];
+  sprintf(sess, "%lu", session);
+  saveUserSession(rfid, sess);
+
+  Serial.println("LOGIN - SAVED USER SESSION");
+  
+  rfidReadContext.session = sess;
+
+  clearMessage();
+  displayPrint("Login realizado.", ST77XX_CYAN);
+  clearMessageInFiveSeconds(false);
 }
 
 void clearMessageInFiveSeconds(bool reset) {
@@ -256,19 +471,26 @@ void clearMessageInFiveSeconds(bool reset) {
 }
 
 void loop() {
+  timeClient.update();
+
   if (isCardPresent()) {
     String tag = getCardId();
-    String name;
-    String role;
+    String name = "";
+    String role = "";
+    String session = "";
 
-    uint8_t accessType = getUser(tag, name, role); // tipo de acesso
+    uint8_t accessType = getUser(tag, &name, &role, &session); // tipo de acesso
 
-    if (rfidReadCallback != NULL) {
+    if (rfidReadCallback) {
       rfidReadCallback(tag);
-      clearRfidReadCallback(false);
+      clearRfidReadCallbackPartial();
     } else {
-      if (tag.equals("6375457A")) {
+      if (tag.equals(RESETCARD)) {
         saveConfig("wifi_reset", "1");
+
+        LittleFS.remove("lista.csv");
+        LittleFS.remove("log.csv");
+        ESP.restart();
       }
 
       printMessageAccess(tag, name, accessType);
@@ -280,9 +502,12 @@ void loop() {
   if (previousMillis) {
     unsigned long currentMillis = millis();
 
-    if ((currentMillis - previousMillis) >= 5000) {
+    if ((currentMillis - previousMillis) >= 3000) {
       previousMillis = 0;
       printMessageDefault();
+      if (willRestart) {
+        ESP.restart();
+      }
     }
   }
 
@@ -290,7 +515,7 @@ void loop() {
     unsigned long currentMillis = millis();
 
     if ((currentMillis - rfidReadContext.ms) >= 15000) {
-      clearRfidReadCallback(true);
+      clearRfidReadCallback();
       printMessageDefault();
     }
   }
@@ -330,11 +555,11 @@ void printMessageDefault() {
   if (configReset == 1) {
     String wifiName = "WiFi: ";
     String wifiPassword = "Senha: ";
-    String wifiIp = "http://";
+    String wifiIp = "http://192.168.4.1";
     
     wifiName.concat(configWiFiName2);
     wifiPassword.concat(configWiFiPassword2);
-    wifiIp.concat(WiFi.softAPIP().toString());
+    //wifiIp.concat(WiFi.localIP().toString()); // WiFi.localIP()
 
     displayPrint(wifiName, ST77XX_WHITE);
     displayPrint(wifiPassword, ST77XX_WHITE);
@@ -351,17 +576,21 @@ void printMessageAccess(String RFID, String Name, short newAccesslvl) {
   clearMessage();
 
   if (newAccesslvl == 0) {
+    saveLog(RFID, 0, "");
+
     displayPrint("Entrada recusada", ST77XX_ORANGE);
     Serial.println("Acesso negado:");
     Serial.println(RFID);
   } else {
+    saveLog(RFID, 1, "");
+
     String userName = "Nome: ";
     String spaces = "      ";
 
     userName.concat(Name.substring(0, 20));
     spaces.concat(Name.substring(20, 40));
 
-    displayPrint("Entrada liberada", ST77XX_CYAN);
+    displayPrint("Entrada liberada", ST77XX_GREEN);
     displayPrint("", ST77XX_WHITE);
     displayPrint(userName, ST77XX_WHITE);
     displayPrint(spaces, ST77XX_WHITE);
@@ -422,17 +651,16 @@ uint8_t getConfig() {
 
   String path = "config.txt";
   File config = LittleFS.open(path, "r");
-  // File config = SD.open("config.txt")
 
-  // caso for possivel abrir o arquivo
-  if (config) {
+  if (config) { // caso for possivel abrir o arquivo
     Serial.println("lendo config.txt");
     
     while (config.available()) {
       current = "";
       currentvalue = "";
       char c = '\0';
-
+      
+      // READ KEY
       do {
         c = char(config.read());
 
@@ -454,6 +682,7 @@ uint8_t getConfig() {
 
       c = '\0';
 
+      // READ VALUE
       do {
         c = char(config.read());
 
@@ -574,97 +803,84 @@ uint8_t saveConfig(String ConfigToSearch, String ValueToSave) {
 }
 
 uint8_t getUser(String RFID) {
-  return getUser(RFID, "", "");
+  String dummy = "";
+  return getUser(RFID, &dummy, &dummy, &dummy);
 }
 
-uint8_t getUser(String RFID, String Name, String Role) {
-  String current = "";
+uint8_t getUser(String RFID, String *Name, String *Role, String *Session) {
   uint8_t accesslvl = 0;
-  int userCount = 0;
 
   String path = "lista.csv";
   File list = LittleFS.open(path, "r");
 
-  // caso for possivel abrir o arquivo
-  if (list) {
+  if (list) { // caso for possivel abrir o arquivo
     Serial.println("lendo lista.csv");
-    
+
+    String current = "";
+    String buffer = "";
+    int userCount = 0;
+    int column = 0;
+
     while (list.available()) {
-      char c = '\0';
-      
-      do {
-        c = char(list.read());
+      char c = char(list.read()); // current character being read
 
-        if ((c == ',') || (c == '\n')) {
-          break;
-        } else {
-          current.concat(c);
-        }
-
-      } while (list.available());
-
-      Serial.printf("current: %s\n", current);
-
-      userCount++;
-      if (current == RFID) {
-        accesslvl = char(list.read()) - '0'; // ler o numero depois da virgula que indica se eh ou n eh administrador
-      
-        if (!list.available() || (c == '\n')) {
-          current = "";
-          accesslvl = 0;
-          break;
-        }
-
-        c = char(list.read()); // descartar vírgula
-
-        if (!list.available() || (c == '\n')) {
-          current = "";
-          accesslvl = 0;
-          break;
-        }
-
-        do {
-          c = char(list.read());
-
-          if ((c == ',') || (c == '\n')) {
-            break;
-          } else {
-            Role.concat(c);
-          }
-
-        } while (list.available());
-
-        do {
-          c = char(list.read());
-
-          if ((c == '\n')) {
-            break;
-          } else {
-            Name.concat(c);
-          }
-
-        } while (list.available());
-      } else {
-        current = "";
-
-        do {
-          c = char(list.read());
-
-          if (c == '\n') {
-            break;
-          }
-
-        } while (list.available());
+      if (c == '\r') {
+        continue;
       }
 
-      Serial.println(accesslvl);
+      if ((c == ',') || (c == '\n')) {
+        switch (column) {
+          case 0:
+            current.concat(buffer);
+            Serial.printf("current: %s\n", current);
+            break;
+          case 1:
+            Serial.println(buffer.charAt(0));
+            if (current == RFID) {
+              accesslvl = buffer.charAt(0) - '0';
+            }
+            break;
+          case 2:
+            if (current == RFID) {
+              Name->concat(buffer);
+            }
+            break;
+          case 3:
+            if (current == RFID) {
+              Role->concat(buffer);
+            }
+            break;
+          case 4:
+            if (current == RFID) {
+              Session->concat(buffer);
+            }
+            userCount++;
+            break;
+        }
+
+        buffer = "";
+        column++;
+
+        if (c == '\n') {
+          current = "";
+          column = 0;
+        }
+      } else {
+        buffer.concat(c);
+      }
     }
+
     list.close();
     Serial.println("fechando lista.csv");
 
-    if (userCount == 0) {
-      clearMessage();
-      displayPrint("Registrar cartao admin...", ST77XX_WHITE);
+    if ((userCount == 0) && (configReset == 0)) {
+      clearRfidReadCallback();
+
+      rfidReadContext.accesslvl = 3;
+      rfidReadContext.name = "Admin";
+      rfidReadContext.role = "admin";
+      rfidReadContext.ms = millis();
+      rfidReadCallback = createRfidUser;
     }
   } else {
     File create = LittleFS.open(path, "w");
@@ -675,116 +891,196 @@ uint8_t getUser(String RFID, String Name, String Role) {
   return accesslvl;
 }
 
-uint8_t saveUser(String RFID, short newAccesslvl) {
-  return saveUser(RFID, "", "", newAccesslvl);
+bool saveUserSession(String RFID, String Session) {
+  String name = "";
+  String role = "";
+  String dummy = "";
+
+  uint8_t accesslvl = getUser(RFID, &name, &role, &dummy);
+  return saveUser(RFID, name, role, Session, accesslvl);
 }
 
-uint8_t saveUser(String RFID, String Name, String Role, short newAccesslvl) {
-    short n = 0; // linha
-    String current = ""; // string do RFID
-    short accesslvl = -1; // 0 = n encontrou   1 = encontrou e eh usuario comum   2 = encontrou e eh adm
-    short state = 0;
+bool saveUser(String RFID, String Name, String Role, String Session, short newAccesslvl) {
+  String path = "lista.csv";
+  String old_path = "lista_old.csv";
 
-    String path = "lista.csv";
-    File list = LittleFS.open(path, "r+");
+  int success = LittleFS.rename(path, old_path);
+  if (!success) {
+    Serial.println("não possivel renomear lista.csv");
+    return 1;
+  }
+
+  File list = LittleFS.open(path, "w");
+  File old_list = LittleFS.open(old_path, "r");
+
+  if (list && old_list) { // caso for possivel abrir o arquivo
+    Serial.println("gravando lista.csv");
+
+    String current = "";
+    String line = "";
+
+    bool isRfid = 1;
+    bool found = 0;
+
+    while (old_list.available()) {
+      char c = char(old_list.read()); // current character being read
+
+      if (c == '\n') {
+        list.print(line);
+        list.print("\n");
+        isRfid = 1;
+        current = "";
+        line = "";
+        continue;
+      }
       
-    if (list) {
-      Serial.println("lendo lista.csv");
-      
-      while (list.available()) {  // le linha por linha do arquivo ate acabar, ou ate encontrar uma correspondencia com o RFID lido, e entao da um break
-          for (short i = 0; i < 8; i++) {
-              current.concat(char(list.read()));
-          }
-          list.read(); // leia e ignore a virgula
-          accesslvl = char(list.read()) - '0';
-          list.read(); // leia e ignore o \r
-          list.read(); // leia e ignore o \n
-          n++;
-          if (current == RFID) {
-              break;
-          }
-          current = "";
-          accesslvl = -1;
+      if (c == ',') {
+        isRfid = 0;
       }
 
-      Serial.println("escrevendo lista.csv");
-    
-      if (accesslvl == -1) {   // criar nova linha com o cadastro do novo usuario
-          state = 1;
-          list.print(RFID);
-          list.print(',');
-          list.print(newAccesslvl);
-          list.print('\r');
-          list.print('\n');
-          Serial.println("CADASTROU");
-      } else { 
-          state = 1;
-          if (accesslvl != 0) {newAccesslvl = 0; state = 2;}
-
-          list.seek((n - 1) * 12);
-          list.print(RFID);
-          list.print(',');
-          list.print(newAccesslvl);
-          Serial.println("REMOVEU");
+      if (RFID.equals(current)) {
+        if (found == 0) {
+          found = 1;
+          line.concat(",");
+          line.concat(char(newAccesslvl + '0'));
+          line.concat(",");
+          line.concat(Name);
+          line.concat(",");
+          line.concat(Role);
+          line.concat(",");
+          line.concat(Session);
+        }
+      } else {
+        line.concat(c);
       }
-      list.close();
-      Serial.println("fechando lista.csv");
+
+      if (isRfid == 1) {
+        current.concat(c);
+      }
     }
 
-    return state;
+    if (found == 0) {
+      line = "";
+      line.concat(RFID);
+      line.concat(",");
+      line.concat(char(newAccesslvl + '0'));
+      line.concat(",");
+      line.concat(Name);
+      line.concat(",");
+      line.concat(Role);
+      line.concat(",");
+      line.concat(Session);
+      line.concat("\n");
+      list.print(line);
+    }
+
+    old_list.close();
+    list.close();
+    Serial.println("fechando lista.csv e old_lista.csv");
+
+    int success = LittleFS.remove(old_path);
+    if (!success) {
+      Serial.println("não possivel deletar old_lista.csv");
+      return 1;
+    } else {
+      Serial.println("deletar old_lista.csv");
+    }
+    
+  } else if (!list) {
+    Serial.println("nao abrimos a lista.csv");
+    return 1;
+  } else if (!old_list) {
+    Serial.println("nao abrimos a old_lista.csv");
+    return 1;
+  } else {
+    Serial.println("nao gravamos absolutamente nada");
+    return 1;
+  }
+
+  return 0;
 }
 
 void saveLog(String RFID, short action, String admRFID) {
   // action
-  // 0 - bloqueado
-  // 1 - identificado
-  // 2 - cadastrado
-  // 3 - removido/desativado
+  // 0 - acesso negado
+  // 1 - acesso permitido
+  // 10 - usuário deletado
+  // 11 - usuário registrado
+  // 12 - moderador registrado
+  // 13 - admin registrado
   String path = "log.csv";
   File accesslog = LittleFS.open(path, "a");
     
   if (accesslog) {
     Serial.println("escrevendo log.csv");
+
+    unsigned long time = timeClient.getEpochTime();
+    char timestamp[50];
+    sprintf(timestamp, "%lu", time);
     
-    accesslog.print("hora,");
-    
-    if (RFID == MASTERCARD) {
-      accesslog.print("MSTRCARD");
-    } else {
-      accesslog.print(RFID);
-    }
+    accesslog.print(timestamp);
+    accesslog.print(",");
+
+    bool actionBy = 0;
     
     switch (action) {
       case 0:
-        accesslog.print(",BLOQUEADO");
+        accesslog.print("0");
         break;
       case 1:
-        accesslog.print(",IDENTIFICADO");
+        accesslog.print("1");
         break;
-      case 2:
-        accesslog.print(",ADICIONADO POR,");
-        if (RFID == MASTERCARD) {
-          accesslog.print(admRFID);
-        } else {
-          accesslog.print(",ADICIONADO POR MASTERCARD");
-        }
+      case 10:
+        actionBy = 1;
+        accesslog.print("10");
         break;
-      case 3:
-        accesslog.print(",REMOVIDO POR,");
-        if (RFID == MASTERCARD) {
-          accesslog.print(admRFID);
-        } else {
-          accesslog.print(",REMOVIDO POR MASTERCARD");
-        }
+      case 11:
+        actionBy = 1;
+        accesslog.print("11");
+        break;
+      case 12:
+        actionBy = 1;
+        accesslog.print("12");
+        break;
+      case 13:
+        actionBy = 1;
+        accesslog.print("13");
         break;
       default:
-        accesslog.print(",");
+        accesslog.print("99");
         break;
     }
+
+    String name = "";
+    String role = "";
+    String dummy = "";
+    getUser(RFID, &name, &role, &dummy);
+
+    accesslog.print(",");
+    accesslog.print(RFID);
+    accesslog.print(",");
+    accesslog.print(name);
+    accesslog.print(",");
+    accesslog.print(role);
+    accesslog.print(",");
+
+    if (actionBy) {
+      String admName = "";
+      getUser(RFID, &admName, &dummy, &dummy);
+
+      accesslog.print(admRFID);
+      accesslog.print(",");
+      accesslog.print(admName);
+    } else {
+      accesslog.print(",");
+    }
     
-    accesslog.print('\r');
     accesslog.print('\n');
     accesslog.close();
     Serial.println("fechando log.csv");
+  } else {
+    File create = LittleFS.open(path, "w");
+    create.close();
+    Serial.println("nao foi possivel abrir log.csv");
   }
 }
