@@ -73,6 +73,9 @@ void setup() {
 
   SPI.begin();
 
+  pinMode(SD_CARD_CS, OUTPUT);
+  digitalWrite(SD_CARD_CS, LOW);
+
  // Inicia display
   displayInit();
 
@@ -419,7 +422,13 @@ void clearRfidReadCallbackPartial() {
 }
 
 void createRfidUser(String rfid) {
-  rfidReadContext.rfid = rfid;
+  String dummy = "";
+  uint8_t oldaccesslvl = getUser(rfid, &dummy, &dummy, &dummy);
+  if (oldaccesslvl >= 1) {
+    Serial.println("USER ALREADY EXISTS");
+    clearRfidReadCallback();
+    return;
+  }
 
   saveUser(rfid, rfidReadContext.name, rfidReadContext.role, "0", rfidReadContext.accesslvl);
 
@@ -436,6 +445,8 @@ void createRfidUser(String rfid) {
     displayPrint("Cartao registrado.", ST77XX_CYAN);
     clearMessageInFiveSeconds(false);
   }
+
+  rfidReadContext.rfid = rfid;
 }
 
 void doLogin(String rfid) {
@@ -443,7 +454,6 @@ void doLogin(String rfid) {
 
   String dummy = "";
   rfidReadContext.accesslvl = getUser(rfid, &rfidReadContext.name, &rfidReadContext.role, &dummy);
-  rfidReadContext.rfid.concat(rfid);
 
   if (rfidReadContext.accesslvl <= 1) {
     Serial.println("LOGIN - NOT A MODERATOR");
@@ -459,6 +469,7 @@ void doLogin(String rfid) {
   Serial.println("LOGIN - SAVED USER SESSION");
   
   rfidReadContext.session = sess;
+  rfidReadContext.rfid.concat(rfid);
 
   clearMessage();
   displayPrint("Login realizado.", ST77XX_CYAN);
@@ -493,9 +504,14 @@ void loop() {
         ESP.restart();
       }
 
+      if (accessType > 0) {
+        digitalWrite(SD_CARD_CS, HIGH);
+      }
+
       printMessageAccess(tag, name, accessType);
       clearMessageInFiveSeconds(false);
       delay(1000);
+      digitalWrite(SD_CARD_CS, LOW);
     }
   }
 
@@ -524,7 +540,7 @@ void loop() {
 void displayInit() {
   display.initR(INITR_BLACKTAB); // Init ST7735S chip, black tab
   display.setTextColor(ST7735_WHITE);
-  display.setRotation(3);
+  display.setRotation(1);
   display.setTextWrap(true);
 
   Serial.println("Display iniciado.");
